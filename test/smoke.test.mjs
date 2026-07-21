@@ -78,8 +78,9 @@ test('--json emits parseable output with the documented schema', () => {
   const { status, stdout } = run([fixture('Timer.tsx'), '--json']);
   assert.equal(status, 0);
   const model = JSON.parse(stdout);
-  assert.equal(model.components.length, 1);
-  const timer = model.components[0];
+  assert.equal(model.files.length, 1);
+  assert.equal(model.files[0].components.length, 1);
+  const timer = model.files[0].components[0];
   assert.equal(timer.name, 'Timer');
   assert.equal(timer.effects.length, 4);
   const ev = timer.effects[0];
@@ -92,6 +93,22 @@ test('--json emits parseable output with the documented schema', () => {
   for (const key of ['reads', 'stateReads', 'external', 'setState', 'scheduledSetState']) {
     assert.ok(key in ev.tally, `tally missing "${key}"`);
   }
+});
+
+test('multiple file arguments are analyzed together, sorted', () => {
+  const { status, stdout } = run([fixture('Timer.tsx'), fixture('Blast.tsx'), '--json']);
+  assert.equal(status, 0);
+  const model = JSON.parse(stdout);
+  const names = model.files.map((f) => path.basename(f.file));
+  assert.deepEqual(names, ['Blast.tsx', 'Timer.tsx']);
+});
+
+test('a glob pattern expands to matching .tsx files', () => {
+  const { status, stdout } = run([path.join(here, 'fixtures', '*.tsx'), '--json']);
+  assert.equal(status, 0);
+  const model = JSON.parse(stdout);
+  const names = model.files.map((f) => path.basename(f.file)).sort();
+  assert.deepEqual(names, ['Blast.tsx', 'None.tsx', 'Timer.tsx']);
 });
 
 test('file with no useEffect reports it cleanly and exits 0', () => {

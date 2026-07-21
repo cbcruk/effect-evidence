@@ -357,14 +357,15 @@ function collectFile(file) {
 }
 
 // ---- view: render ----
-function renderText({ file, components }) {
+function renderText({ files }) {
   const out = [];
-  out.push(`# ${file}`);
-  out.push('# useEffect 엑스레이 — 지금 이 effect가 무엇에 배선돼 있는지 투시한다. 뭘 할진 읽는 사람.\n');
+  out.push('# useEffect 엑스레이 — 지금 이 effect가 무엇에 배선돼 있는지 투시한다. 뭘 할진 읽는 사람.');
 
-  if (components.length === 0) { out.push('(useEffect 없음)'); return out.join('\n'); }
+  for (const { file, components } of files) {
+    out.push(`\n${'═'.repeat(64)}\n# ${file}`);
+    if (components.length === 0) { out.push('(useEffect 없음)'); continue; }
 
-  for (const comp of components) {
+    for (const comp of components) {
     out.push(`\n${'━'.repeat(64)}\nCOMPONENT ${comp.name}  (L${comp.loc})`);
 
     for (const ev of comp.effects) {
@@ -411,22 +412,37 @@ function renderText({ file, components }) {
       if (ev.depsDiff.length) {
         out.push(`    deps가 주장하지 않는 reactive read: ${ev.depsDiff.join(', ')}   (의도적 제외일 수 있음 — 원문 확인)`);
       }
+      }
     }
   }
   return out.join('\n');
 }
 
 // ---- cli ----
-const args = process.argv.slice(2);
-const json = args.includes('--json');
-const file = args.find(a => !a.startsWith('-'));
-if (!file) {
-  console.error('usage: effect-xray <file.tsx> [--json]');
+// Multiple files/globs in one shot. Cross-file "shared source" is NOT tracked: a bare
+// setter name means different state in different files, so name-join across files would
+// manufacture false wiring — the exact discipline this tool avoids. Real cross-module
+// dataflow is a future compiler-pass swap-in. Here we just widen the input, per file.
+const argv = process.argv.slice(2);
+const json = argv.includes('--json');
+const patterns = argv.filter(a => !a.startsWith('-'));
+if (patterns.length === 0) {
+  console.error('usage: effect-xray <file.tsx | glob> [more…] [--json]');
   process.exit(1);
 }
-if (!fs.existsSync(file)) {
-  console.error(`not found: ${file}`);
-  process.exit(1);
+
+const isGlob = (p) => /[*?[\]{}]/.test(p);
+const paths = [];
+for (const p of patterns) {
+  if (isGlob(p)) {
+    for (const m of fs.globSync(p)) paths.push(m);
+  } else {
+    if (!fs.existsSync(p)) { console.error(`not found: ${p}`); process.exit(1); }
+    paths.push(p);
+  }
 }
-const model = collectFile(file);
+const files = [...new Set(paths)].filter(p => /\.tsx?$/.test(p)).sort();
+if (files.length === 0) { console.error('no .ts/.tsx files matched'); process.exit(1); }
+
+const model = { files: files.map(collectFile) };
 console.log(json ? JSON.stringify(model, null, 2) : renderText(model));

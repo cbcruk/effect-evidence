@@ -1,13 +1,13 @@
 {
-  "name": "effect-evidence",
-  "version": "0.4.0",
+  "name": "effect-xray",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "bin": {
-    "effect-evidence": "./effect-evidence.mjs"
+    "effect-xray": "./effect-xray.mjs"
   },
   "scripts": {
-    "start": "node effect-evidence.mjs",
+    "start": "node effect-xray.mjs",
     "test": "node --test"
   },
   "dependencies": {

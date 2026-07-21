@@ -1,20 +1,18 @@
 #!/usr/bin/env node
-// effect-evidence — the wiring diagram that comes along when you rip out a useEffect.
-// Input to the removal, not evidence for a verdict. Nothing here is on trial.
+// effect-xray — 지금 이 useEffect가 무엇에 배선돼 있는지 투시하는 엑스레이.
+// 판결(evidence)도, 제거 지시(removal)도 아니다. 지금 있는 구조를 드러낼 뿐 — 뭘 할지는 읽는 사람.
 //
-// THE guardrail: never auto-apply a removal. Deleting an effect changes render timing and
-// intermediate state, and the right replacement (render-time compute / event handler /
-// useSyncExternalStore / key reset) is decided by intent that isn't in the code. Judge freely,
-// act by hand. The React compiler holds the same line: detect, human fixes, human commits.
+// 왜 판단하지 않나: effect를 어떻게 할지는 코드에 없는 '의도'가 정한다(렌더 계산 / 이벤트 핸들러 /
+// useSyncExternalStore / key 리셋). 엑스레이는 드러내고, 결정은 사람·에이전트가. 그래서 출력은
+// 본성상 read-only다 — 적용할 행위가 애초에 없다. (React 컴파일러도 같은 선: 탐지, 사람이 수정.)
 //
-// Discipline: maximize coordinates + verbatim source, minimize claims.
-// - Every "read" is resolved ONE hop by name-join and shown as its declaration's real source.
-// - name-join can be wrong (shadowing / rename / duplicates). So the tool never hides that:
-//   0 matches -> "선언 못 찾음", 2+ -> "중복 N (스코프 확인)". The uncertainty is an OUTPUT.
-// - A setter also called outside the effect is a blast-radius warning: move that write into
-//   render and the other call sites become a competing source of truth. Cut slowly.
-// - When a read resolves to a value that is itself hook-derived (useMemo/useCallback/custom hook),
-//   we emit a "→ 추적 계속: L__" pointer instead of computing reactivity. The next hop is the human's.
+// 규율: 좌표 + 원문은 최대로, 주장은 최소로. 강조는 reactivity 배선에만 — 덤프가 아니라 회로도.
+// - 모든 "read"는 name-join으로 한 홉 해석해 선언 원문을 그대로 보여준다.
+// - name-join은 틀릴 수 있다(섀도잉 / 리네임 / 중복). 그래서 숨기지 않는다: 0건 -> "선언 못 찾음",
+//   2건+ -> "중복 N (스코프 확인)". 불확실성도 출력의 일부다.
+// - effect 밖에서도 구동되는 setter는 사실로 함께 표시한다 — 그 상태의 공동 소스가 어디인지.
+// - read가 hook 파생값(useMemo/useCallback/custom hook)으로 해석되면 reactivity를 계산하는 대신
+//   "→ 추적 계속: L__" 포인터를 남긴다. 다음 홉은 사람 몫.
 
 import { parse, Lang } from '@ast-grep/napi';
 import fs from 'node:fs';
@@ -214,8 +212,8 @@ function nestedBindings(cb, directLocals) {
 }
 
 // all call sites of each setState-setter across the whole component (line + source index).
-// Mirrors the compiler's usage-count gate: a setter also called OUTSIDE the effect is a strong
-// signal the effect may be legitimate (not pure derived state). We report locations, not a verdict.
+// Mirrors the compiler's usage-count gate: a setter also called OUTSIDE the effect means the
+// effect isn't this state's only source. We report locations, not a verdict.
 function setterCallSites(component) {
   const map = new Map();
   for (const call of component.findAll({ rule: { kind: 'call_expression' } })) {
@@ -250,9 +248,9 @@ const EFFECT_PATTERNS = { any: [
 const REACTIVE_KINDS = new Set(['param', 'useState', 'useReducer', 'useContext', 'useMemo', 'useCallback', 'custom hook']);
 
 // ---- model: collect ----
-// collectEvidence(component) -> EffectEvidence[]. Pure data, no formatting.
+// collectWiring(component) -> EffectWiring[]. Pure data, no formatting.
 // Agents consume this shape directly; renderText below is just one view of it.
-function collectEvidence(component) {
+function collectWiring(component) {
   const table = declTable(component);
   const setterMap = setterCallSites(component);
   const out = [];
@@ -300,8 +298,8 @@ function collectEvidence(component) {
         setter: s.setter,
         state: s.tag.replace('setState → ', ''),
         scheduled: s.scheduled,   // non-null → deferred write, not derived state
-        // blast radius: same setter driven from somewhere else too → moving this effect's write
-        // into render/handler risks a double source of truth. Cut slowly.
+        // this state's other sources: same setter driven from elsewhere too. A fact about the
+        // wire — if you move this write into render, those sites share the same state.
         outsideCallSites: sites
           .filter(c => c.start < effRange.start.index || c.start >= effRange.end.index)
           .map(c => c.line),
@@ -353,20 +351,21 @@ function collectFile(file) {
     if (seen.some(c => sameNode(c, comp))) continue;
     seen.push(comp);
     if (!comp) continue;
-    components.push({ name: componentName(comp), loc: line(comp), effects: collectEvidence(comp) });
+    components.push({ name: componentName(comp), loc: line(comp), effects: collectWiring(comp) });
   }
   return { file, components };
 }
 
 // ---- view: render ----
-function renderText({ file, components }) {
+function renderText({ files }) {
   const out = [];
-  out.push(`# ${file}`);
-  out.push('# effect 걷어낼 때 딸려오는 배선도 — 어디에 연결돼 있는지만 뽑는다. 자르는 건 사람.\n');
+  out.push('# useEffect 엑스레이 — 지금 이 effect가 무엇에 배선돼 있는지 투시한다. 뭘 할진 읽는 사람.');
 
-  if (components.length === 0) { out.push('(useEffect 없음)'); return out.join('\n'); }
+  for (const { file, components } of files) {
+    out.push(`\n${'═'.repeat(64)}\n# ${file}`);
+    if (components.length === 0) { out.push('(useEffect 없음)'); continue; }
 
-  for (const comp of components) {
+    for (const comp of components) {
     out.push(`\n${'━'.repeat(64)}\nCOMPONENT ${comp.name}  (L${comp.loc})`);
 
     for (const ev of comp.effects) {
@@ -400,10 +399,10 @@ function renderText({ file, components }) {
         out.push(`      L${String(s.loc).padEnd(4)} ${s.verbatim.slice(0, 60).padEnd(60)} [${tag}]`);
         if (s.kind !== 'setState' || s.scheduled) continue;
         if (s.outsideCallSites.length === 0) {
-          out.push(`             └ ${s.setter}: effect 밖 호출 0건 (이 effect 안에서만 호출됨)`);
+          out.push(`             └ ${s.setter}: effect 밖 구동 없음 (이 effect 안에서만)`);
         } else {
-          out.push(`             └ ⚠ blast radius — ${s.setter}가 effect 밖에서도 ${s.outsideCallSites.length}곳: ${s.outsideCallSites.map(l => 'L' + l).join(', ')}`);
-          out.push(`               렌더/핸들러로 옮기면 double source 충돌 가능 → 그 지점들 먼저 확인.`);
+          out.push(`             └ ${s.setter}: effect 밖에서도 ${s.outsideCallSites.length}곳 구동 — ${s.outsideCallSites.map(l => 'L' + l).join(', ')}`);
+          out.push(`               (이 상태의 공동 소스 — 렌더로 옮기면 그 지점들과 같은 상태를 공유하게 됨)`);
         }
       }
 
@@ -411,7 +410,8 @@ function renderText({ file, components }) {
       const sched = t.scheduledSetState ? ` (그중 지연 콜백 ${t.scheduledSetState})` : '';
       out.push(`    집계: read ${t.reads}건 (state/reducer로 해결 ${t.stateReads}) · 외부 접촉 ${t.external} · setState ${t.setState}${sched}`);
       if (ev.depsDiff.length) {
-        out.push(`    deps에 없는 reactive read: ${ev.depsDiff.join(', ')}   (의도적 제외일 수 있음 — 원문 확인)`);
+        out.push(`    deps가 주장하지 않는 reactive read: ${ev.depsDiff.join(', ')}   (의도적 제외일 수 있음 — 원문 확인)`);
+      }
       }
     }
   }
@@ -419,16 +419,30 @@ function renderText({ file, components }) {
 }
 
 // ---- cli ----
-const args = process.argv.slice(2);
-const json = args.includes('--json');
-const file = args.find(a => !a.startsWith('-'));
-if (!file) {
-  console.error('usage: effect-evidence <file.tsx> [--json]');
+// Multiple files/globs in one shot. Cross-file "shared source" is NOT tracked: a bare
+// setter name means different state in different files, so name-join across files would
+// manufacture false wiring — the exact discipline this tool avoids. Real cross-module
+// dataflow is a future compiler-pass swap-in. Here we just widen the input, per file.
+const argv = process.argv.slice(2);
+const json = argv.includes('--json');
+const patterns = argv.filter(a => !a.startsWith('-'));
+if (patterns.length === 0) {
+  console.error('usage: effect-xray <file.tsx | glob> [more…] [--json]');
   process.exit(1);
 }
-if (!fs.existsSync(file)) {
-  console.error(`not found: ${file}`);
-  process.exit(1);
+
+const isGlob = (p) => /[*?[\]{}]/.test(p);
+const paths = [];
+for (const p of patterns) {
+  if (isGlob(p)) {
+    for (const m of fs.globSync(p)) paths.push(m);
+  } else {
+    if (!fs.existsSync(p)) { console.error(`not found: ${p}`); process.exit(1); }
+    paths.push(p);
+  }
 }
-const model = collectFile(file);
+const files = [...new Set(paths)].filter(p => /\.tsx?$/.test(p)).sort();
+if (files.length === 0) { console.error('no .ts/.tsx files matched'); process.exit(1); }
+
+const model = { files: files.map(collectFile) };
 console.log(json ? JSON.stringify(model, null, 2) : renderText(model));

@@ -1,4 +1,4 @@
-// Regression smoke tests for effect-evidence.
+// Regression smoke tests for effect-xray.
 // Black-box: spawn the real CLI so the entry point, exit codes, text view, and --json
 // contract are all under test. No test framework dependency — Node's built-in runner.
 //
@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const CLI = path.join(here, '..', 'effect-evidence.mjs');
+const CLI = path.join(here, '..', 'effect-xray.mjs');
 const fixture = (name) => path.join(here, 'fixtures', name);
 
 // Run the CLI. Returns { status, stdout, stderr }. Never throws on non-zero exit.
@@ -32,11 +32,11 @@ test('derived-state antipattern: setState-from-state is surfaced', () => {
   assert.match(stdout, /setState → label/);
 });
 
-test('scheduled setState is labeled deferred and exempt from blast radius', () => {
+test('scheduled setState is labeled deferred and not flagged as a shared source', () => {
   const { stdout } = run([fixture('Timer.tsx')]);
   assert.match(stdout, /지연 쓰기 — 파생 아님/);
-  // the deferred setTime must not carry a blast-radius warning
-  assert.doesNotMatch(stdout, /blast radius — setTime/);
+  // the deferred setTime is exempt: no "driven outside the effect" line for it
+  assert.doesNotMatch(stdout, /setTime: effect 밖/);
 });
 
 test('setTimeout/clearTimeout are not misclassified as state setters', () => {
@@ -55,7 +55,7 @@ test('deps-less useLayoutEffect is detected', () => {
 
 test('reactive read missing from deps shows up in depsDiff', () => {
   const { stdout } = run([fixture('Timer.tsx')]);
-  assert.match(stdout, /deps에 없는 reactive read: doubled/);
+  assert.match(stdout, /deps가 주장하지 않는 reactive read: doubled/);
 });
 
 test('single unparenthesized arrow param stays a nested binding (no phantom read)', () => {
@@ -63,9 +63,9 @@ test('single unparenthesized arrow param stays a nested binding (no phantom read
   assert.match(stdout, /t\s+· 중첩 콜백 바인딩/);
 });
 
-test('blast radius: setter also called outside the effect is warned', () => {
+test('setter also driven outside the effect is reported as a shared source', () => {
   const { stdout } = run([fixture('Blast.tsx')]);
-  assert.match(stdout, /blast radius — setTotal/);
+  assert.match(stdout, /setTotal: effect 밖에서도 \d+곳 구동/);
 });
 
 test('component-level function decl resolves with a next-hop pointer', () => {
@@ -103,7 +103,7 @@ test('file with no useEffect reports it cleanly and exits 0', () => {
 test('no file argument exits 1 with usage', () => {
   const { status, stderr } = run([]);
   assert.equal(status, 1);
-  assert.match(stderr, /usage: effect-evidence/);
+  assert.match(stderr, /usage: effect-xray/);
 });
 
 test('missing file exits 1 with not-found', () => {

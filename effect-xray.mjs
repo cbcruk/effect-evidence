@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// @ts-check
 // effect-xray — 지금 이 useEffect가 무엇에 배선돼 있는지 투시하는 엑스레이.
 // 판결(evidence)도, 제거 지시(removal)도 아니다. 지금 있는 구조를 드러낼 뿐 — 뭘 할지는 읽는 사람.
 //
@@ -17,6 +18,56 @@
 import { parse, Lang } from '@ast-grep/napi';
 import fs from 'node:fs';
 
+/**
+ * The emitted model. Shapes mirror the schema documented in HANDOFF.md — the
+ * `--json` contract. `Node` is one ast-grep syntax node; its `field`/`parent`/
+ * `getMatch` return `SgNode | null`, so the guards below aren't optional.
+ *
+ * @typedef {import('@ast-grep/napi').SgNode} Node
+ *
+ * @typedef {'found' | 'global' | 'nested' | 'notfound' | 'dup'} Resolution
+ * @typedef {'param' | 'useState' | 'useReducer' | 'useContext' | 'useMemo'
+ *   | 'useCallback' | 'useRef' | 'useEffectEvent' | 'custom hook'
+ *   | 'function' | 'const'} KindTag
+ *
+ * @typedef {{ declLine: number, declText: string, kindTag: KindTag, hopTo: number | null }} Decl
+ * @typedef {{ loc: number, verbatim: string, kindTag: KindTag }} Candidate
+ *
+ * @typedef {object} Read
+ * @property {string} name
+ * @property {boolean} shadow
+ * @property {Resolution} resolution
+ * @property {number} [loc]
+ * @property {string} [verbatim]
+ * @property {KindTag} [kindTag]
+ * @property {number | null} [hopTo]
+ * @property {Candidate[]} [candidates]
+ *
+ * @typedef {{ line: number, text: string, tag: string, setter?: string, scheduled?: string | null }} RawEffect
+ *
+ * @typedef {object} SideEffect
+ * @property {number} loc
+ * @property {string} verbatim
+ * @property {'setState' | 'external'} kind
+ * @property {string} [setter]
+ * @property {string} [state]
+ * @property {string | null} [scheduled]
+ * @property {number[]} [outsideCallSites]
+ *
+ * @typedef {{ reads: number, stateReads: number, external: number, setState: number, scheduledSetState: number }} Tally
+ *
+ * @typedef {object} EffectWiring
+ * @property {{ loc: number, endLine: number, deps: string[] | null, depsText: string | null }} effect
+ * @property {Read[]} reads
+ * @property {SideEffect[]} effects
+ * @property {Tally} tally
+ * @property {string[]} depsDiff
+ *
+ * @typedef {{ name: string, loc: number, effects: EffectWiring[] }} Component
+ * @typedef {{ file: string, components: Component[] }} FileWiring
+ * @typedef {{ files: FileWiring[] }} Model
+ */
+
 const FN_KINDS = new Set(['arrow_function', 'function_declaration', 'function_expression', 'method_definition']);
 const WEB_GLOBALS = new Set(['document', 'window', 'localStorage', 'sessionStorage', 'navigator', 'history', 'location']);
 const EXTERNAL_CALLEES = new Set(['fetch', 'addEventListener', 'removeEventListener', 'setInterval', 'setTimeout', 'queueMicrotask']);
@@ -26,41 +77,47 @@ const KNOWN_GLOBALS = new Set(['console', 'Number', 'String', 'Boolean', 'Object
   'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'requestAnimationFrame', 'fetch', 'structuredClone', 'undefined', 'NaN', 'Infinity']);
 
 // setTimeout/setInterval/setImmediate look like setters by name but are globals, not state setters
-const isSetter = (nm) => /^set[A-Z]/.test(nm) && !KNOWN_GLOBALS.has(nm) && !EXTERNAL_CALLEES.has(nm);
+const isSetter = (/** @type {string} */ nm) => /^set[A-Z]/.test(nm) && !KNOWN_GLOBALS.has(nm) && !EXTERNAL_CALLEES.has(nm);
 
-const line = (n) => n.range().start.line + 1;                       // 0-indexed -> 1-indexed
-const oneLine = (t) => t.replace(/\s+/g, ' ').trim();
-const sameNode = (a, b) => a && b && a.range().start.index === b.range().start.index && a.range().end.index === b.range().end.index;
+const line = (/** @type {Node} */ n) => n.range().start.line + 1;  // 0-indexed -> 1-indexed
+const oneLine = (/** @type {string} */ t) => t.replace(/\s+/g, ' ').trim();
+const sameNode = (/** @type {Node | null} */ a, /** @type {Node | null} */ b) => a && b && a.range().start.index === b.range().start.index && a.range().end.index === b.range().end.index;
+// kind() is typed as string | number (kind ids); we only ever use the string name.
+const kindStr = (/** @type {Node} */ n) => String(n.kind());
 
+/** @param {Node} node @returns {Node | null} */
 function enclosingFn(node) {
   let p = node.parent();
-  while (p) { if (FN_KINDS.has(p.kind())) return p; p = p.parent(); }
+  while (p) { if (FN_KINDS.has(kindStr(p))) return p; p = p.parent(); }
   return null;
 }
 
 // `r => r` has no `parameters` field — the single unparenthesized param lives in `parameter`.
 // Missing it leaks every nested callback param out as a phantom read.
-const paramNode = (fn) => fn.field('parameters') || fn.field('parameter');
+const paramNode = (/** @type {Node} */ fn) => fn.field('parameters') || fn.field('parameter');
 
 // names bound by a pattern node (identifier / array_pattern / object_pattern / rename pairs)
+/** @param {Node | null} node @param {Node[]} out @returns {Node[]} */
 function bindingNames(node, out = []) {
   if (!node) return out;
   const k = node.kind();
   if (k === 'identifier' || k === 'shorthand_property_identifier_pattern') { out.push(node); return out; }
   if (k === 'pair_pattern') { bindingNames(node.field('value'), out); return out; }   // {theme: t} -> t
   for (const c of node.children()) {
-    if (['[', ']', '{', '}', ',', ':'].includes(c.kind())) continue;
+    if (['[', ']', '{', '}', ',', ':'].includes(kindStr(c))) continue;
     bindingNames(c, out);
   }
   return out;
 }
 
 // Build the component-level declaration table: name -> {declLine, declText, hopTo|null}
+/** @param {Node} component @returns {Map<string, Decl[]>} */
 function declTable(component) {
+  /** @type {Map<string, Decl[]>} */
   const table = new Map();
-  const add = (name, entry) => {
-    if (!table.has(name)) table.set(name, []);
-    table.get(name).push(entry);
+  const add = (/** @type {string} */ name, /** @type {Decl} */ entry) => {
+    const arr = table.get(name);
+    if (arr) arr.push(entry); else table.set(name, [entry]);
   };
 
   // params
@@ -77,13 +134,17 @@ function declTable(component) {
     if (!sameNode(enclosingFn(d), component)) continue;
     const nameNode = d.field('name');
     const init = d.field('value');
-    const declStmt = d.parent() && d.parent().kind().endsWith('declaration') ? d.parent() : d;
+    const dParent = d.parent();
+    const declStmt = dParent && kindStr(dParent).endsWith('declaration') ? dParent : d;
     let declText = oneLine(declStmt.text());
     const dLine = line(d);
 
     // does the init require a further hop? (its reactivity depends on more code)
-    let hopTo = null, kindTag = 'const';
-    if (init && init.kind() === 'call_expression') {
+    /** @type {number | null} */
+    let hopTo = null;
+    /** @type {KindTag} */
+    let kindTag = 'const';
+    if (init && kindStr(init) === 'call_expression') {
       const callee = init.field('function');
       const cn = callee ? callee.text() : '';
       if (cn === 'useMemo' || cn === 'useCallback') { hopTo = dLine; kindTag = cn; }
@@ -95,11 +156,12 @@ function declTable(component) {
       else if (/^use[A-Z]/.test(cn)) { hopTo = dLine; kindTag = 'custom hook'; }  // reactivity lives inside the hook
     }
     // hop decls point the human to dLine anyway → elide the body, keep callee + dep array (the next-hop input)
-    if (hopTo && init && init.kind() === 'call_expression') {
+    if (hopTo && init && kindStr(init) === 'call_expression') {
       const bn = bindingNames(nameNode)[0];
-      const cn = init.field('function') ? init.field('function').text() : '?';
+      const fnField = init.field('function');
+      const cn = fnField ? fnField.text() : '?';
       const args = init.field('arguments');
-      const arrays = args ? args.children().filter(c => c.kind() === 'array') : [];
+      const arrays = args ? args.children().filter(c => kindStr(c) === 'array') : [];
       const deps = arrays.length ? ', ' + oneLine(arrays[arrays.length - 1].text()) : '';
       declText = `const ${bn ? bn.text() : '?'} = ${cn}(…${deps})`;
     }
@@ -126,6 +188,7 @@ function declTable(component) {
 }
 
 // names declared locally *inside* the callback (params + local decls) — don't send the human chasing these
+/** @param {Node} cb @returns {Set<string>} */
 function callbackLocals(cb) {
   const locals = new Set();
   const p = paramNode(cb);
@@ -149,18 +212,20 @@ function callbackLocals(cb) {
 const SCHEDULER_CALLEES = new Set(['setTimeout', 'setInterval', 'queueMicrotask', 'requestAnimationFrame', 'requestIdleCallback']);
 const SCHEDULER_PROPS = new Set(['then', 'catch', 'finally', 'addEventListener']);
 
+/** @param {Node} node @param {Node} cb @returns {string | null} */
 function schedulerOf(node, cb) {
+  /** @type {Node | null} */
   let n = node;
   while (n && !sameNode(n, cb)) {
-    const p = n.parent();
+    const p = /** @type {Node | null} */ (n.parent());
     if (!p) break;
     // is this function passed as an argument to a scheduling call?
-    if (FN_KINDS.has(n.kind()) && p.kind() === 'arguments') {
+    if (FN_KINDS.has(kindStr(n)) && kindStr(p) === 'arguments') {
       const call = p.parent();
-      const callee = call && call.kind() === 'call_expression' ? call.field('function') : null;
+      const callee = call && kindStr(call) === 'call_expression' ? call.field('function') : null;
       if (callee) {
-        if (callee.kind() === 'identifier' && SCHEDULER_CALLEES.has(callee.text())) return callee.text();
-        const prop = callee.kind() === 'member_expression' ? callee.field('property') : null;
+        if (kindStr(callee) === 'identifier' && SCHEDULER_CALLEES.has(callee.text())) return callee.text();
+        const prop = kindStr(callee) === 'member_expression' ? callee.field('property') : null;
         if (prop && SCHEDULER_PROPS.has(prop.text())) return prop.text();
       }
     }
@@ -170,7 +235,9 @@ function schedulerOf(node, cb) {
 }
 
 // side-effect points inside the callback body
+/** @param {Node} cb @returns {RawEffect[]} */
 function sideEffects(cb) {
+  /** @type {RawEffect[]} */
   const out = [];
   for (const call of cb.findAll({ rule: { kind: 'call_expression' } })) {
     const callee = call.field('function');
@@ -188,7 +255,8 @@ function sideEffects(cb) {
     } else if (ck === 'member_expression') {
       const obj = callee.field('object');
       const objName = obj ? obj.text().split(/[.\[]/)[0] : '';
-      const prop = callee.field('property') ? callee.field('property').text() : '';
+      const propNode = callee.field('property');
+      const prop = propNode ? propNode.text() : '';
       if (WEB_GLOBALS.has(objName) || prop === 'addEventListener' || prop === 'removeEventListener') {
         out.push({ line: line(call), text: oneLine(call.text()), tag: '외부' });
       }
@@ -198,6 +266,7 @@ function sideEffects(cb) {
 }
 
 // every name bound ANYWHERE inside cb (incl. nested callbacks/blocks). Cheap; no scope resolution.
+/** @param {Node} cb @param {Set<string>} directLocals @returns {Set<string>} */
 function nestedBindings(cb, directLocals) {
   const all = new Set();
   for (const fn of cb.findAll({ rule: { any: [{ kind: 'arrow_function' }, { kind: 'function_expression' }, { kind: 'function_declaration' }] } })) {
@@ -214,21 +283,25 @@ function nestedBindings(cb, directLocals) {
 // all call sites of each setState-setter across the whole component (line + source index).
 // Mirrors the compiler's usage-count gate: a setter also called OUTSIDE the effect means the
 // effect isn't this state's only source. We report locations, not a verdict.
+/** @param {Node} component @returns {Map<string, {line: number, start: number}[]>} */
 function setterCallSites(component) {
+  /** @type {Map<string, {line: number, start: number}[]>} */
   const map = new Map();
   for (const call of component.findAll({ rule: { kind: 'call_expression' } })) {
     const callee = call.field('function');
-    if (callee && callee.kind() === 'identifier' && isSetter(callee.text())) {
+    if (callee && kindStr(callee) === 'identifier' && isSetter(callee.text())) {
       const nm = callee.text();
-      if (!map.has(nm)) map.set(nm, []);
-      map.get(nm).push({ line: line(call), start: call.range().start.index });
+      const arr = map.get(nm);
+      const site = { line: line(call), start: call.range().start.index };
+      if (arr) arr.push(site); else map.set(nm, [site]);
     }
   }
   return map;
 }
 
+/** @param {Node} cb @param {Set<string>} locals @param {Set<string>} shadowy @returns {{name: string, shadow: boolean}[]} */
 function collectReads(cb, locals, shadowy) {
-  const seen = new Set(); const reads = [];
+  const seen = new Set(); /** @type {{name: string, shadow: boolean}[]} */ const reads = [];
   for (const id of cb.findAll({ rule: { kind: 'identifier' } })) {
     const nm = id.text();
     if (locals.has(nm)) continue;
@@ -250,15 +323,18 @@ const REACTIVE_KINDS = new Set(['param', 'useState', 'useReducer', 'useContext',
 // ---- model: collect ----
 // collectWiring(component) -> EffectWiring[]. Pure data, no formatting.
 // Agents consume this shape directly; renderText below is just one view of it.
+/** @param {Node} component @returns {EffectWiring[]} */
 function collectWiring(component) {
   const table = declTable(component);
   const setterMap = setterCallSites(component);
+  /** @type {EffectWiring[]} */
   const out = [];
 
   for (const eff of component.findAll({ rule: EFFECT_PATTERNS })) {
     if (!sameNode(enclosingFn(eff), component)) continue;   // belongs to a nested component
 
     const cb = eff.getMatch('CB');
+    if (!cb) continue;   // useEffect with no callback match — nothing to x-ray
     const depsNode = eff.getMatch('DEPS');
     const locals = callbackLocals(cb);
     const shadowy = nestedBindings(cb, locals);
@@ -267,30 +343,33 @@ function collectWiring(component) {
     const effRange = eff.range();
 
     let stateReads = 0;
+    /** @type {Set<string>} */
     const reactiveReads = new Set();
+    /** @type {Read[]} */
     const reads = rawReads.map(({ name, shadow }) => {
       const hits = table.get(name) || [];
       if (hits.length === 0) {
         // bound in a nested callback and nowhere in the component → it IS that binding,
         // not a broken lookup. Cheap precision without real scope resolution.
         const resolution = KNOWN_GLOBALS.has(name) ? 'global' : shadow ? 'nested' : 'notfound';
-        return { name, shadow, resolution };
+        return /** @type {Read} */ ({ name, shadow, resolution });
       }
       if (hits.length > 1) {
-        return {
+        return /** @type {Read} */ ({
           name, shadow, resolution: 'dup',
           candidates: hits.map(h => ({ loc: h.declLine, verbatim: h.declText, kindTag: h.kindTag })),
-        };
+        });
       }
       const h = hits[0];
       if (h.kindTag === 'useState' || h.kindTag === 'useReducer') stateReads++;
       // reactive for deps purposes? exclude setters/dispatch, refs, effect events, shadowed reads
       if (!shadow && REACTIVE_KINDS.has(h.kindTag) && !isSetter(name) && name !== 'dispatch') reactiveReads.add(name);
-      return { name, shadow, resolution: 'found', loc: h.declLine, verbatim: h.declText, kindTag: h.kindTag, hopTo: h.hopTo };
+      return /** @type {Read} */ ({ name, shadow, resolution: 'found', loc: h.declLine, verbatim: h.declText, kindTag: h.kindTag, hopTo: h.hopTo });
     });
 
+    /** @type {SideEffect[]} */
     const effects = fx.map(s => {
-      const base = { loc: s.line, verbatim: s.text, kind: s.setter ? 'setState' : 'external' };
+      const base = { loc: s.line, verbatim: s.text, kind: /** @type {'setState' | 'external'} */ (s.setter ? 'setState' : 'external') };
       if (!s.setter) return base;
       const sites = setterMap.get(s.setter) || [];
       return {
@@ -332,19 +411,25 @@ function collectWiring(component) {
   return out;
 }
 
+/** @param {Node | null} comp @returns {string} */
 function componentName(comp) {
-  if (comp && comp.field('name')) return comp.field('name').text();
+  const cn = comp && comp.field('name');
+  if (cn) return cn.text();
   const p = comp && comp.parent();
-  if (p && p.field && p.field('name')) return p.field('name').text();
+  const pn = p && p.field && p.field('name');
+  if (pn) return pn.text();
   return '(anon)';
 }
 
+/** @param {string} file @returns {FileWiring} */
 function collectFile(file) {
   const src = fs.readFileSync(file, 'utf8');
   const lang = file.endsWith('.ts') ? Lang.TypeScript : Lang.Tsx;
   const root = parse(lang, src).root();
 
+  /** @type {Component[]} */
   const components = [];
+  /** @type {(Node | null)[]} */
   const seen = [];
   for (const eff of root.findAll({ rule: EFFECT_PATTERNS })) {
     const comp = enclosingFn(eff);
@@ -357,7 +442,8 @@ function collectFile(file) {
 }
 
 // ---- view: render ----
-function renderText({ files }) {
+/** @returns {string} */
+function renderText(/** @type {Model} */ { files }) {
   const out = [];
   out.push('# useEffect 엑스레이 — 지금 이 effect가 무엇에 배선돼 있는지 투시한다. 뭘 할진 읽는 사람.');
 
@@ -382,8 +468,9 @@ function renderText({ files }) {
         } else if (r.resolution === 'notfound') {
           out.push(`      ${nm} ✗ 선언 못 찾음 (외부/모듈 또는 추적끊김)${shadowTag}`);
         } else if (r.resolution === 'dup') {
-          out.push(`      ${nm} ⚠ 중복 선언 ${r.candidates.length}건 — 스코프 확인 필요:${shadowTag}`);
-          for (const c of r.candidates) out.push(`      ${' '.repeat(16)}   L${c.loc} ${c.verbatim}`);
+          const cands = r.candidates ?? [];
+          out.push(`      ${nm} ⚠ 중복 선언 ${cands.length}건 — 스코프 확인 필요:${shadowTag}`);
+          for (const c of cands) out.push(`      ${' '.repeat(16)}   L${c.loc} ${c.verbatim}`);
         } else {
           const hop = r.hopTo ? `   → 추적 계속: L${r.hopTo}` : '';
           out.push(`      ${nm} L${String(r.loc).padEnd(4)} ${r.verbatim}${hop}${shadowTag}`);
@@ -398,10 +485,11 @@ function renderText({ files }) {
           : '외부';
         out.push(`      L${String(s.loc).padEnd(4)} ${s.verbatim.slice(0, 60).padEnd(60)} [${tag}]`);
         if (s.kind !== 'setState' || s.scheduled) continue;
-        if (s.outsideCallSites.length === 0) {
+        const sites = s.outsideCallSites ?? [];
+        if (sites.length === 0) {
           out.push(`             └ ${s.setter}: effect 밖 구동 없음 (이 effect 안에서만)`);
         } else {
-          out.push(`             └ ${s.setter}: effect 밖에서도 ${s.outsideCallSites.length}곳 구동 — ${s.outsideCallSites.map(l => 'L' + l).join(', ')}`);
+          out.push(`             └ ${s.setter}: effect 밖에서도 ${sites.length}곳 구동 — ${sites.map(l => 'L' + l).join(', ')}`);
           out.push(`               (이 상태의 공동 소스 — 렌더로 옮기면 그 지점들과 같은 상태를 공유하게 됨)`);
         }
       }
@@ -431,7 +519,8 @@ if (patterns.length === 0) {
   process.exit(1);
 }
 
-const isGlob = (p) => /[*?[\]{}]/.test(p);
+const isGlob = (/** @type {string} */ p) => /[*?[\]{}]/.test(p);
+/** @type {string[]} */
 const paths = [];
 for (const p of patterns) {
   if (isGlob(p)) {

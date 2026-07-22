@@ -13,14 +13,16 @@ import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.join(here, '..', 'effect-xray.mjs');
-const fixture = (name) => path.join(here, 'fixtures', name);
+const fixture = (/** @type {string} */ name) => path.join(here, 'fixtures', name);
 
 // Run the CLI. Returns { status, stdout, stderr }. Never throws on non-zero exit.
+/** @param {string[]} args */
 function run(args) {
   try {
     const stdout = execFileSync('node', [CLI, ...args], { encoding: 'utf8' });
     return { status: 0, stdout, stderr: '' };
-  } catch (err) {
+  } catch (e) {
+    const err = /** @type {{ status?: number, stdout?: string, stderr?: string }} */ (e);
     return { status: err.status ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
   }
 }
@@ -99,7 +101,7 @@ test('multiple file arguments are analyzed together, sorted', () => {
   const { status, stdout } = run([fixture('Timer.tsx'), fixture('Blast.tsx'), '--json']);
   assert.equal(status, 0);
   const model = JSON.parse(stdout);
-  const names = model.files.map((f) => path.basename(f.file));
+  const names = model.files.map((/** @type {{ file: string }} */ f) => path.basename(f.file));
   assert.deepEqual(names, ['Blast.tsx', 'Timer.tsx']);
 });
 
@@ -107,7 +109,7 @@ test('a glob pattern expands to matching .tsx files', () => {
   const { status, stdout } = run([path.join(here, 'fixtures', '*.tsx'), '--json']);
   assert.equal(status, 0);
   const model = JSON.parse(stdout);
-  const names = model.files.map((f) => path.basename(f.file)).sort();
+  const names = model.files.map((/** @type {{ file: string }} */ f) => path.basename(f.file)).sort();
   assert.deepEqual(names, ['Blast.tsx', 'None.tsx', 'Timer.tsx']);
 });
 

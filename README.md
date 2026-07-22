@@ -69,13 +69,15 @@ COMPONENT C  (L3)
 
 단일 파일도 `files` 1건으로 온다. `EffectWiring` 필드 정의는 [`HANDOFF.md`](./HANDOFF.md) 참조.
 
-## 테스트
+## 테스트 · 타입체크
 
 ```bash
-pnpm test   # node --test, 새 의존성 없음
+pnpm test        # tsc(타입체크) + node --test
+pnpm typecheck   # 타입체크만
 ```
 
 실제 CLI를 스폰하는 블랙박스 smoke-test. 어서션은 라인 번호가 아닌 내용 기준이라 라인이 밀려도 안 깨진다.
+소스는 `.mjs`이되 JSDoc + `// @ts-check`로 타입 검사한다 — **빌드 단계는 없고**, `.mjs`는 그대로 실행된다(`typescript`/`@types/node`는 devDep).
 
 ## 하지 않는 것 (구멍이 아니라 이음새)
 

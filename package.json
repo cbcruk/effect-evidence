@@ -1,6 +1,6 @@
 {
   "name": "effect-xray",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "type": "module",
   "bin": {
@@ -8,9 +8,14 @@
   },
   "scripts": {
     "start": "node effect-xray.mjs",
-    "test": "node --test"
+    "typecheck": "tsc",
+    "test": "tsc && node --test"
   },
   "dependencies": {
     "@ast-grep/napi": "^0.44.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
   }
 }
